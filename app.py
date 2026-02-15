@@ -1,167 +1,154 @@
 import streamlit as st
 import os
-import tempfile
-import re
 from dotenv import load_dotenv
-from difflib import SequenceMatcher
-from langchain_community.document_loaders import (
-    TextLoader,
-    PyPDFLoader,
-    UnstructuredPowerPointLoader
-)
+from PyPDF2 import PdfReader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.prompts import PromptTemplate
+from langchain.chains.question_answering import load_qa_chain
+from langchain_google_genai import ChatGoogleGenerativeAI
 
-# ----------------- CONFIG -----------------
+# ----------------------------
+# Load .env file
+# ----------------------------
 load_dotenv()
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-st.set_page_config(
-    page_title="AI Document Copilot",
-    page_icon="🤖",
-    layout="wide"
-)
+if not GOOGLE_API_KEY:
+    st.warning("Google API key not found! Please add it in your .env file.")
+    st.stop()
 
-st.title("🤖 AI Document Copilot")
+# ----------------------------
+# PDF Text Extraction
+# ----------------------------
+def get_pdf_text(pdf_docs):
+    text = ""
+    for pdf in pdf_docs:
+        pdf_reader = PdfReader(pdf)
+        for page in pdf_reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+    return text
 
-# ----------------- SESSION STATE -----------------
-if "lines" not in st.session_state:
-    st.session_state.lines = []
+# ----------------------------
+# Split text into chunks
+# ----------------------------
+def get_text_chunks(text):
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    return text_splitter.split_text(text)
 
-if "doc_loaded" not in st.session_state:
-    st.session_state.doc_loaded = False
+# ----------------------------
+# Create FAISS vector store
+# ----------------------------
+def get_vector_store(text_chunks):
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
+    vector_store.save_local("faiss_index")
+    return vector_store
 
-if "last_chunk_size" not in st.session_state:
-    st.session_state.last_chunk_size = 0
-
-# ----------------- SIDEBAR -----------------
-with st.sidebar:
-    st.header("📂 Document Status / Upload")
-
-    # --------------- FILE UPLOAD IN SIDEBAR ---------------
-    files = st.file_uploader(
-        "Browse Document (PDF / TXT / PPTX)",
-        type=["pdf", "txt", "pptx"],
-        accept_multiple_files=True
+# ----------------------------
+# Setup conversational QA chain (Google Gemini)
+# ----------------------------
+def get_conversational_chain():
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        google_api_key=GOOGLE_API_KEY,
+        temperature=0
     )
 
-    if st.session_state.doc_loaded:
-        st.success("✅ Document Loaded Successfully")
+    prompt_template = """
+    Answer the question as thoroughly as possible using the context below. 
+    If the answer is not present, generate the most reasonable answer based on the PDFs.
 
-        st.markdown("### 📦 Chunk Info")
-        st.write(f"Total Chunks (Lines): **{len(st.session_state.lines)}**")
-        st.write(f"Last Answer Chunk Size: **{st.session_state.last_chunk_size}**")
+    Context:
+    {context}
 
-        if st.button("🗑️ Delete / Clear Document"):
-            st.session_state.lines = []
-            st.session_state.doc_loaded = False
-            st.session_state.last_chunk_size = 0
-            st.experimental_rerun()
-    else:
-        st.info("No document loaded yet")
+    Question:
+    {question}
 
-# ----------------- LOAD DOCUMENT -----------------
-if files:
-    with st.spinner("Processing document..."):
-        full_text = []
+    Answer:
+    """
+    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+    chain = load_qa_chain(llm, chain_type="stuff", prompt=prompt)
+    return chain
 
-        for f in files:
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                tmp.write(f.getvalue())
-                path = tmp.name
+# ----------------------------
+# Handle user input
+# ----------------------------
+def user_input(user_question):
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
-            try:
-                if f.name.endswith(".pdf"):
-                    loader = PyPDFLoader(path)
-                elif f.name.endswith(".txt"):
-                    loader = TextLoader(path, encoding="utf-8")
-                elif f.name.endswith(".pptx"):
-                    loader = UnstructuredPowerPointLoader(path)
-                else:
-                    continue
+    # Load FAISS vector store
+    vector_store = st.session_state.get("vector_store", None)
+    if vector_store is None:
+        if not os.path.exists("faiss_index"):
+            st.warning("Please upload PDFs and process them first!")
+            return
+        vector_store = FAISS.load_local(
+            "faiss_index",
+            embeddings,
+            allow_dangerous_deserialization=True
+        )
+        st.session_state["vector_store"] = vector_store
 
-                docs = loader.load()
-                for d in docs:
-                    full_text.append(d.page_content)
+    # Retrieve relevant chunks (semantic search)
+    docs = vector_store.similarity_search(user_question, k=5)
 
-            finally:
-                os.unlink(path)
+    # Load QA chain
+    chain = st.session_state.get("qa_chain", None)
+    if chain is None:
+        chain = get_conversational_chain()
+        st.session_state["qa_chain"] = chain
 
-        raw_lines = "\n".join(full_text).split("\n")
+    # Get answer
+    response = chain({"input_documents": docs, "question": user_question}, return_only_outputs=True)
+    
+    # Store conversation
+    if "conversation" not in st.session_state:
+        st.session_state["conversation"] = []
+    st.session_state["conversation"].append((user_question, response["output_text"]))
 
-        clean_lines = []
-        stop_sections = {"index", "glossary", "references"}
+# ----------------------------
+# Streamlit UI
+# ----------------------------
+def main():
+    st.set_page_config(page_title="Chat PDF with Google Gemini")
+    st.header("Chat with PDF 💁")
 
-        for line in raw_lines:
-            line = line.strip()
-            lower = line.lower()
+    with st.sidebar:
+        st.title("Upload PDF Files")
+        pdf_docs = st.file_uploader("Upload PDFs and click Submit & Process", accept_multiple_files=True)
+        if st.button("Submit & Process"):
+            if pdf_docs:
+                with st.spinner("Processing PDFs..."):
+                    raw_text = get_pdf_text(pdf_docs)
+                    text_chunks = get_text_chunks(raw_text)
+                    vector_store = get_vector_store(text_chunks)
+                    st.session_state["vector_store"] = vector_store
+                    st.success("PDFs processed! You can now ask questions.")
+            else:
+                st.warning("Please upload at least one PDF file.")
 
-            if lower in stop_sections:
-                break
+    # User input
+    user_question = st.text_input("Ask a question from your PDF files:")
+    if user_question:
+        user_input(user_question)
 
-            if re.fullmatch(r"\d+", line):
-                continue
+    # Display conversation
+    if "conversation" in st.session_state:
+        for i, (q, a) in enumerate(st.session_state["conversation"]):
+            st.markdown(f"**Q{i+1}:** {q}")
+            st.markdown(f"**A{i+1}:** {a}")
+            st.markdown("---")
 
-            if re.search(r"\|\s*\d+$", line):
-                continue
+if __name__ == "__main__":
+    main()
 
-            if re.search(r",\s*\d", line) and line.count(",") >= 2:
-                continue
 
-            line = re.sub(r"^\d+[\.\)\-]\s*", "", line)
 
-            if line:
-                clean_lines.append(line)
 
-        st.session_state.lines = clean_lines
-        st.session_state.doc_loaded = True
-        st.success("✅ Document processed and chunked successfully")
-
-# ----------------- HELPERS -----------------
-def similarity(a, b):
-    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
-
-def is_heading(line):
-    words = line.split()
-    if len(words) < 2 or len(words) > 10:
-        return False
-    caps = sum(1 for w in words if w[0].isupper())
-    return (caps / len(words)) >= 0.7
-
-def find_best_chunk(question, lines):
-    best_idx = 0
-    best_score = 0.0
-
-    for i, line in enumerate(lines):
-        score = similarity(question, line)
-        if score > best_score:
-            best_score = score
-            best_idx = i
-
-    chunk = []
-    for line in lines[best_idx + 1:]:
-        if is_heading(line):
-            break
-        chunk.append(line)
-
-    return chunk
-
-# ----------------- QUESTION AREA -----------------
-st.header("❓ Ask Question")
-
-question = st.text_input("Ask anything from the document:")
-
-if question and st.session_state.lines:
-    with st.spinner("Finding best answer..."):
-        chunk = find_best_chunk(question, st.session_state.lines)
-        st.session_state.last_chunk_size = len(chunk)
-
-        if chunk:
-            st.subheader("✅ Answer")
-            st.write(" ".join(chunk))  # <-- Shows answer in paragraph form
-        else:
-            st.info("ℹ️ No direct answer found")
-
-# ----------------- FOOTER -----------------
-st.markdown("---")
-st.markdown("Built with ❤️ using Streamlit")
 
 
 
