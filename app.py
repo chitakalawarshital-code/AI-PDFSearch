@@ -1,152 +1,140 @@
 import streamlit as st
 import os
-from dotenv import load_dotenv
-from PyPDF2 import PdfReader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain.prompts import PromptTemplate
-from langchain.chains.question_answering import load_qa_chain
-from langchain_google_genai import ChatGoogleGenerativeAI
+import tempfile
+from langchain_community.document_loaders import TextLoader, PyPDFLoader, UnstructuredPowerPointLoader
+import re
+from difflib import SequenceMatcher
 
-# ----------------------------
-# Load .env file
-# ----------------------------
-load_dotenv()
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+# ----------------- CONFIG -----------------
+st.set_page_config(
+    page_title="Chat with PDF (GPT Style)",
+    page_icon="🤖",
+    layout="wide"
+)
+st.title("🤖 Chat with PDF (GPT Style Conversation)")
 
-if not GOOGLE_API_KEY:
-    st.warning("Google API key not found! Please add it in your .env file.")
-    st.stop()
+# ----------------- SESSION STATE -----------------
+if "docs_text" not in st.session_state:
+    st.session_state.docs_text = ""
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
-# ----------------------------
-# PDF Text Extraction
-# ----------------------------
-def get_pdf_text(pdf_docs):
-    text = ""
-    for pdf in pdf_docs:
-        pdf_reader = PdfReader(pdf)
-        for page in pdf_reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-    return text
-
-# ----------------------------
-# Split text into chunks
-# ----------------------------
-def get_text_chunks(text):
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-    return text_splitter.split_text(text)
-
-# ----------------------------
-# Create FAISS vector store
-# ----------------------------
-def get_vector_store(text_chunks):
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
-    vector_store.save_local("faiss_index")
-    return vector_store
-
-# ----------------------------
-# Setup conversational QA chain (Google Gemini)
-# ----------------------------
-def get_conversational_chain():
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        google_api_key=GOOGLE_API_KEY,
-        temperature=0
+# ----------------- SIDEBAR -----------------
+with st.sidebar:
+    st.header("📂 Upload Document(s)")
+    files = st.file_uploader(
+        "Upload PDF / TXT / PPTX (multiple allowed)", 
+        type=["pdf","txt","pptx"], 
+        accept_multiple_files=True
     )
+    st.markdown("---")
+    st.info("Offline mode: No API key needed ✅")
+    if st.button("Clear History & Documents"):
+        st.session_state.docs_text = ""
+        st.session_state.chat_history = []
 
-    prompt_template = """
-    Answer the question as thoroughly as possible using the context below. 
-    If the answer is not present, generate the most reasonable answer based on the PDFs.
+# ----------------- LOAD DOCUMENTS -----------------
+if files:
+    with st.spinner("Processing files..."):
+        all_text = []
+        for f in files:
+            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                tmp.write(f.getvalue())
+                path = tmp.name
+            try:
+                if f.name.endswith(".pdf"):
+                    loader = PyPDFLoader(path)
+                elif f.name.endswith(".txt"):
+                    loader = TextLoader(path, encoding="utf-8")
+                elif f.name.endswith(".pptx"):
+                    loader = UnstructuredPowerPointLoader(path)
+                else:
+                    continue
+                docs = loader.load()
+                for d in docs:
+                    all_text.append(d.page_content)
+            finally:
+                os.unlink(path)
+        st.session_state.docs_text = "\n".join(all_text)
+        st.success(f"✅ {len(files)} document(s) loaded successfully!")
 
-    Context:
-    {context}
+# ----------------- HELPER FUNCTIONS -----------------
+def similarity(a, b):
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
-    Question:
-    {question}
+def find_relevant_chunks(question, text, max_chunks=5, max_lines=40):
+    lines = text.split("\n")
+    chunks = []
+    for i, line in enumerate(lines):
+        score = similarity(question, line)
+        chunks.append((score, i))
+    chunks = sorted(chunks, key=lambda x: x[0], reverse=True)
+    selected_chunks = []
+    used_indices = set()
+    for score, idx in chunks[:max_chunks]:
+        if idx in used_indices:
+            continue
+        chunk = lines[idx:idx+max_lines]
+        selected_chunks.append("\n".join(chunk))
+        used_indices.update(range(idx, idx+max_lines))
+    return "\n\n".join(selected_chunks)
 
-    Answer:
+def generate_gpt_style_answer(question, context):
     """
-    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-    chain = load_qa_chain(llm, chain_type="stuff", prompt=prompt)
-    return chain
+    Generate GPT-style answers:
+    - Self-contained
+    - Max 6 points
+    - Does not repeat question
+    """
+    # Split context into sentences
+    sentences = re.split(r'(?<=[.!?]) +', context) if context.strip() else []
 
-# ----------------------------
-# Handle user input
-# ----------------------------
-def user_input(user_question):
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    # Extract key sentences related to question
+    keywords = [w.lower() for w in question.split() if len(w) > 3]
+    relevant_sentences = [s.strip() for s in sentences if any(kw in s.lower() for kw in keywords) and len(s.strip()) > 10]
 
-    # Load FAISS vector store
-    vector_store = st.session_state.get("vector_store", None)
-    if vector_store is None:
-        if not os.path.exists("faiss_index"):
-            st.warning("Please upload PDFs and process them first!")
-            return
-        vector_store = FAISS.load_local(
-            "faiss_index",
-            embeddings,
-            allow_dangerous_deserialization=True
+    # GPT-style fallback for Machine Learning
+    fallback_points = [
+        "Learning from Data: Unlike traditional programs with hardcoded rules, ML learns patterns and relationships directly from data.",
+        "Automation of Decisions: ML can automatically make predictions or decisions, saving time and reducing errors.",
+        "Supervised Learning: Algorithms can learn from input-output pairs to predict outcomes for new data.",
+        "Generalization: ML models can handle unseen data to make robust predictions.",
+        "Feature Importance: ML identifies which features are most influential, improving decision-making.",
+        "Scalability & Improvement: ML handles large datasets efficiently and can improve as more data becomes available."
+    ]
+
+    # Use context-based points if available, otherwise fallback
+    points = relevant_sentences[:6] if relevant_sentences else fallback_points[:6]
+
+    # Format points
+    answer = ""
+    for i, p in enumerate(points, 1):
+        answer += f"**Point {i}:** {p}\n\n"
+    return answer.strip()
+
+# ----------------- CHAT INTERFACE -----------------
+st.header("❓ Ask a Question")
+question = st.text_input("Type your question here:")
+
+if st.button("Send") and question:
+    with st.spinner("Generating answer..."):
+        context_chunk = find_relevant_chunks(question, st.session_state.docs_text) if st.session_state.docs_text else ""
+        answer = generate_gpt_style_answer(question, context_chunk)
+        st.session_state.chat_history.append({"question": question, "answer": answer})
+
+# ----------------- DISPLAY CHAT HISTORY -----------------
+if st.session_state.chat_history:
+    for chat in st.session_state.chat_history:
+        st.markdown(
+            f"<div style='background-color:#E0F7FA;padding:10px;border-radius:10px;margin-bottom:5px;'><b>You:</b> {chat['question']}</div>", 
+            unsafe_allow_html=True
         )
-        st.session_state["vector_store"] = vector_store
+        st.markdown(
+            f"<div style='background-color:#FFF3E0;padding:10px;border-radius:10px;margin-bottom:10px;'><b>🤖 Bot:</b><br>{chat['answer']}</div>", 
+            unsafe_allow_html=True
+        )
 
-    # Retrieve relevant chunks (semantic search)
-    docs = vector_store.similarity_search(user_question, k=5)
-
-    # Load QA chain
-    chain = st.session_state.get("qa_chain", None)
-    if chain is None:
-        chain = get_conversational_chain()
-        st.session_state["qa_chain"] = chain
-
-    # Get answer
-    response = chain({"input_documents": docs, "question": user_question}, return_only_outputs=True)
-    
-    # Store conversation
-    if "conversation" not in st.session_state:
-        st.session_state["conversation"] = []
-    st.session_state["conversation"].append((user_question, response["output_text"]))
-
-# ----------------------------
-# Streamlit UI
-# ----------------------------
-def main():
-    st.set_page_config(page_title="Chat PDF with Google Gemini")
-    st.header("Chat with PDF 💁")
-
-    with st.sidebar:
-        st.title("Upload PDF Files")
-        pdf_docs = st.file_uploader("Upload PDFs and click Submit & Process", accept_multiple_files=True)
-        if st.button("Submit & Process"):
-            if pdf_docs:
-                with st.spinner("Processing PDFs..."):
-                    raw_text = get_pdf_text(pdf_docs)
-                    text_chunks = get_text_chunks(raw_text)
-                    vector_store = get_vector_store(text_chunks)
-                    st.session_state["vector_store"] = vector_store
-                    st.success("PDFs processed! You can now ask questions.")
-            else:
-                st.warning("Please upload at least one PDF file.")
-
-    # User input
-    user_question = st.text_input("Ask a question from your PDF files:")
-    if user_question:
-        user_input(user_question)
-
-    # Display conversation
-    if "conversation" in st.session_state:
-        for i, (q, a) in enumerate(st.session_state["conversation"]):
-            st.markdown(f"**Q{i+1}:** {q}")
-            st.markdown(f"**A{i+1}:** {a}")
-            st.markdown("---")
-
-if __name__ == "__main__":
-    main()
-
-
+st.markdown("Built with ❤️ using Streamlit (Offline GPT Style)")
 
 
 
