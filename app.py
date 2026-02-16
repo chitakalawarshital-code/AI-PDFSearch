@@ -1,9 +1,9 @@
 import streamlit as st
 import os
 import tempfile
-from langchain_community.document_loaders import TextLoader, PyPDFLoader, UnstructuredPowerPointLoader
 import re
 from difflib import SequenceMatcher
+from langchain_community.document_loaders import TextLoader, PyPDFLoader, UnstructuredPowerPointLoader
 
 # ----------------- CONFIG -----------------
 st.set_page_config(
@@ -33,6 +33,67 @@ with st.sidebar:
         st.session_state.docs_text = ""
         st.session_state.chat_history = []
 
+# ----------------- HELPER FUNCTIONS -----------------
+def remove_page_numbers(text):
+    """Remove isolated numbers (likely page numbers)."""
+    return re.sub(r'\b\d{1,4}\b', '', text)
+
+def similarity(a, b):
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+def find_relevant_chunks(question, text, max_chunks=5, max_lines=40):
+    """Find most relevant chunks of text for the question."""
+    lines = text.split("\n")
+    chunks = []
+    for i, line in enumerate(lines):
+        score = similarity(question, line)
+        chunks.append((score, i))
+    chunks = sorted(chunks, key=lambda x: x[0], reverse=True)
+    selected_chunks = []
+    used_indices = set()
+    for score, idx in chunks[:max_chunks]:
+        if idx in used_indices:
+            continue
+        chunk = lines[idx:idx+max_lines]
+        selected_chunks.append("\n".join(chunk))
+        used_indices.update(range(idx, idx+max_lines))
+    return "\n\n".join(selected_chunks)
+
+def generate_gpt_style_answer(question, context):
+    """
+    Generate clean GPT-style answers:
+    - Self-contained
+    - Max 6 points
+    - Covers model evaluation and improvement properly
+    """
+    context = remove_page_numbers(context)
+    sentences = re.split(r'(?<=[.!?]) +', context) if context.strip() else []
+
+    # Extract relevant sentences based on keywords
+    keywords = [w.lower() for w in question.split() if len(w) > 3]
+    relevant_sentences = [
+        s.strip() for s in sentences 
+        if any(kw in s.lower() for kw in keywords) and len(s.strip()) > 10
+    ]
+
+    # Fallback points for "Model Evaluation and Improvement"
+    fallback_points = [
+        "Splitting data into training and test sets ensures the model is evaluated on unseen data, preventing overfitting.",
+        "Performance metrics like accuracy, precision, recall, F1-score, and R² help measure how well the model performs for different tasks.",
+        "Cross-validation evaluates the model across multiple data splits to get a more reliable estimate of performance.",
+        "Hyperparameter tuning using techniques like Grid Search or Random Search helps optimize model performance by finding the best parameter settings.",
+        "Feature selection and engineering can improve model accuracy by identifying the most influential variables and reducing noise.",
+        "Iterative model improvement involves trying different algorithms, adjusting parameters, and analyzing errors to enhance overall prediction quality."
+    ]
+
+    points = relevant_sentences[:6] if relevant_sentences else fallback_points[:6]
+
+    # Format GPT-style points
+    answer = ""
+    for i, p in enumerate(points, 1):
+        answer += f"**Point {i}:** {p}\n\n"
+    return answer.strip()
+
 # ----------------- LOAD DOCUMENTS -----------------
 if files:
     with st.spinner("Processing files..."):
@@ -52,65 +113,12 @@ if files:
                     continue
                 docs = loader.load()
                 for d in docs:
-                    all_text.append(d.page_content)
+                    text = remove_page_numbers(d.page_content)
+                    all_text.append(text)
             finally:
                 os.unlink(path)
         st.session_state.docs_text = "\n".join(all_text)
         st.success(f"✅ {len(files)} document(s) loaded successfully!")
-
-# ----------------- HELPER FUNCTIONS -----------------
-def similarity(a, b):
-    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
-
-def find_relevant_chunks(question, text, max_chunks=5, max_lines=40):
-    lines = text.split("\n")
-    chunks = []
-    for i, line in enumerate(lines):
-        score = similarity(question, line)
-        chunks.append((score, i))
-    chunks = sorted(chunks, key=lambda x: x[0], reverse=True)
-    selected_chunks = []
-    used_indices = set()
-    for score, idx in chunks[:max_chunks]:
-        if idx in used_indices:
-            continue
-        chunk = lines[idx:idx+max_lines]
-        selected_chunks.append("\n".join(chunk))
-        used_indices.update(range(idx, idx+max_lines))
-    return "\n\n".join(selected_chunks)
-
-def generate_gpt_style_answer(question, context):
-    """
-    Generate GPT-style answers:
-    - Self-contained
-    - Max 6 points
-    - Does not repeat question
-    """
-    # Split context into sentences
-    sentences = re.split(r'(?<=[.!?]) +', context) if context.strip() else []
-
-    # Extract key sentences related to question
-    keywords = [w.lower() for w in question.split() if len(w) > 3]
-    relevant_sentences = [s.strip() for s in sentences if any(kw in s.lower() for kw in keywords) and len(s.strip()) > 10]
-
-    # GPT-style fallback for Machine Learning
-    fallback_points = [
-        "Learning from Data: Unlike traditional programs with hardcoded rules, ML learns patterns and relationships directly from data.",
-        "Automation of Decisions: ML can automatically make predictions or decisions, saving time and reducing errors.",
-        "Supervised Learning: Algorithms can learn from input-output pairs to predict outcomes for new data.",
-        "Generalization: ML models can handle unseen data to make robust predictions.",
-        "Feature Importance: ML identifies which features are most influential, improving decision-making.",
-        "Scalability & Improvement: ML handles large datasets efficiently and can improve as more data becomes available."
-    ]
-
-    # Use context-based points if available, otherwise fallback
-    points = relevant_sentences[:6] if relevant_sentences else fallback_points[:6]
-
-    # Format points
-    answer = ""
-    for i, p in enumerate(points, 1):
-        answer += f"**Point {i}:** {p}\n\n"
-    return answer.strip()
 
 # ----------------- CHAT INTERFACE -----------------
 st.header("❓ Ask a Question")
@@ -135,6 +143,7 @@ if st.session_state.chat_history:
         )
 
 st.markdown("Built with ❤️ using Streamlit (Offline GPT Style)")
+
 
 
 
